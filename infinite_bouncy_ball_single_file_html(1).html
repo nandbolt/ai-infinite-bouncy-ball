@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Infinite Bouncy Ball — Noise World</title>
+  <style>
+    :root{
+      --bg0:#0c0e14; --bg1:#0a0c12; --ink:#e8ecf6; --muted:#aeb6c9;
+      --accent:#7dd3fc; --accent2:#a78bfa; --gold:#ffd166; --emerald:#80ed99;
+    }
+    html,body{margin:0;height:100%;overflow:hidden;background:var(--bg0);color:var(--ink);font-family:system-ui,ui-sans-serif,Segoe UI,Roboto,Helvetica,Arial}
+    canvas{display:block;width:100vw;height:100vh}
+    #hud{position:fixed;inset:12px auto auto 12px;display:flex;gap:10px;flex-direction:column;z-index:10}
+    .card{background:rgba(20,22,32,.6);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px 12px;backdrop-filter:blur(6px);box-shadow:0 8px 24px rgba(0,0,0,.35);font-size:12px;line-height:1.35}
+    .row{display:flex;gap:8px;align-items:center}
+    .pill{border:1px solid rgba(255,255,255,.1);border-radius:999px;padding:.5px 8px;background:rgba(255,255,255,.06)}
+    .kbd{padding:2px 6px;border:1px solid #444;border-bottom-width:2px;border-radius:6px;font-family:ui-monospace,Menlo,Consolas,monospace;background:#171923}
+    #toasts{position:fixed;right:12px;bottom:12px;display:flex;flex-direction:column;gap:8px;z-index:20;pointer-events:none}
+    .toast{pointer-events:auto;background:rgba(20,22,32,.8);border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:8px 10px;box-shadow:0 10px 30px rgba(0,0,0,.4);font-size:12px}
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hud">
+    <div class="card">
+      <div><strong>Infinite Bouncy Ball — OpenSimplex World</strong></div>
+      <div class="row" style="margin-top:6px">
+        <span class="kbd">A/D</span> · <span class="kbd">◀/▶</span> move
+        <span class="kbd">Space</span> jump
+        <span class="kbd">Shift</span> boost
+        <span class="kbd">R</span> reset
+      </div>
+      <div class="row" style="margin-top:6px;opacity:.9">
+        Terrain via <span class="pill">OpenSimplex</span> · Infinite ±X/±Y · Chests & items · Roaming animals
+      </div>
+    </div>
+    <div class="card" id="inv">Inventory — Coins: 0 · Gems: 0 · Boosts: 0</div>
+    <div class="card" id="dbg"></div>
+  </div>
+  <div id="toasts"></div>
+
+<script>
+(() => {
+  // ===== Canvas / DPI =====
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  let vw=960, vh=540, DPR = Math.max(1, Math.min(2, window.devicePixelRatio||1));
+  function resize(){
+    vw = Math.floor(window.innerWidth); vh = Math.floor(window.innerHeight);
+    canvas.width = Math.floor(vw*DPR); canvas.height = Math.floor(vh*DPR);
+    canvas.style.width = vw+"px"; canvas.style.height = vh+"px";
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize', resize); resize();
+
+  // ===== Utils =====
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  function rndSeed(x){ let s=x>>>0; return ()=>{s|=0;s=(s+0x6D2B79F5)|0;let t=Math.imul(s^(s>>>15),1|s);t=t+Math.imul(t^(t>>>7),61|t)^t;return ((t^(t>>>14))>>>0)/4294967296}; }
+
+  // ===== OpenSimplex 2D (public domain, adapted for brevity) =====
+  // Based on Kurt Spencer / KdotJPG reference. Deterministic with 64-bit-like seed.
+  function OpenSimplex2D(seed){
+    const STRETCH= -0.211324865405187, SQUISH=0.366025403784439; // (1/sqrt(2+1)-1)/2, (sqrt(2+1)-1)/2
+    const NORM=47.0;
+    let perm = new Uint8Array(256), permGradIndex = new Uint8Array(256);
+    function hashSeed(seed){
+      let r = rndSeed(seed);
+      let src = new Uint8Array(256); for(let i=0;i<256;i++) src[i]=i;
+      for(let i=255;i>=0;i--){ let j = (r()* (i+1))|0; let n=src[j]; src[j]=src[i]; src[i]=n; }
+      for(let i=0;i<256;i++){ let v=src[i]; perm[i]=v; permGradIndex[i]=(v%12)*2; }
+    }
+    hashSeed(seed);
+    const gradients2D = new Float32Array([
+      5, 2, 2, 5,  -5, 2, -2, 5,  5,-2, 2,-5,  -5,-2, -2,-5,
+      5, 0, -5, 0,  0, 5, 0,-5,  3, 3, -3, 3,  3,-3, -3,-3
+    ]);
+    function expt(i){ return i & 255; }
+    function extrapolate(xsb, ysb, dx, dy){
+      let index = perm[xsb + perm[ysb]]; index = permGradIndex[index];
+      return gradients2D[index]*dx + gradients2D[index+1]*dy;
+    }
+    this.noise2D = function(x, y){
+      // Place input coordinates onto grid.
+      let stretchOffset = (x + y) * STRETCH; let xs = x + stretchOffset; let ys = y + stretchOffset;
+      // Floor to get simplectic honeycomb coordinates of rhombus (stretched square) super-cell origin.
+      let xsb = Math.floor(xs), ysb = Math.floor(ys);
+      let squishOffset = (xsb + ysb) * SQUISH; let dx0 = x - (xsb + squishOffset); let dy0 = y - (ysb + squishOffset);
+      // Sum those together to get a value that determines which region we're in.
+      let xins = xs - xsb, yins = ys - ysb; let inSum = xins + yins;
+      // Positions relative to origin point.
+      let dx_ext=0, dy_ext=0, xsv_ext=0, ysv_ext=0;
+      let value = 0;
+      // Contribution (1,0)
+      let dx1 = dx0 - 1 - SQUISH; let dy1 = dy0 - 0 - SQUISH; let attn1 = 2 - dx1*dx1 - dy1*dy1;
+      if (attn1 > 0){ attn1 *= attn1; value += attn1 * attn1 * extrapolate(xsb + 1, ysb + 0, dx1, dy1); }
+      // Contribution (0,1)
+      let dx2 = dx0 - 0 - SQUISH; let dy2 = dy0 - 1 - SQUISH; let attn2 = 2 - dx2*dx2 - dy2*dy2;
+      if (attn2 > 0){ attn2 *= attn2; value += attn2 * attn2 * extrapolate(xsb + 0, ysb + 1, dx2, dy2); }
+      // Contribution (0,0)
+      let attn0 = 2 - dx0*dx0 - dy0*dy0; if (attn0 > 0){ attn0 *= attn0; value += attn0 * attn0 * extrapolate(xsb, ysb, dx0, dy0); }
+      // Extra vertex
+      if (inSum <= 1){
+        let zins = 1 - inSum; if (zins > xins || zins > yins){
+          if (xins > yins){ xsv_ext = xsb + 1; ysv_ext = ysb - 1; dx_ext = dx0 - 1; dy_ext = dy0 + 1; }
+          else { xsv_ext = xsb - 1; ysv_ext = ysb + 1; dx_ext = dx0 + 1; dy_ext = dy0 - 1; }
+        } else { xsv_ext = xsb + 1; ysv_ext = ysb + 1; dx_ext = dx0 - 1 - 2*SQUISH; dy_ext = dy0 - 1 - 2*SQUISH; }
+      } else {
+        let zins = 2 - inSum; if (zins < xins || zins < yins){
+          if (xins > yins){ xsv_ext = xsb + 2; ysv_ext = ysb + 0; dx_ext = dx0 - 2 - 2*SQUISH; dy_ext = dy0 + 0 - 2*SQUISH; }
+          else { xsv_ext = xsb + 0; ysv_ext = ysb + 2; dx_ext = dx0 + 0 - 2*SQUISH; dy_ext = dy0 - 2 - 2*SQUISH; }
+        } else { xsv_ext = xsb; ysv_ext = ysb; dx_ext = dx0; dy_ext = dy0; }
+        xsb += 1; ysb += 1; dx0 = dx0 - 1 - 2*SQUISH; dy0 = dy0 - 1 - 2*SQUISH;
+      }
+      // Extra contribution
+      let attn_ext = 2 - dx_ext*dx_ext - dy_ext*dy_ext; if (attn_ext>0){ attn_ext*=attn_ext; value += attn_ext*attn_ext*extrapolate(xsv_ext, ysv_ext, dx_ext, dy_ext); }
+      return value / NORM; // ~[-1,1]
+    }
+  }
+
+  // ===== World Config (optimized) =====
+  const CHUNK = 512; // chunk size
+  const ACTIVE_RADIUS = 1; // 3x3 chunks active
+  const MAX_CACHE = 256;
+  const TERRAIN_SEED = 1337, ITEM_SEED = 9001, ANIMAL_SEED = 424242;
+  const terrainNoise = new OpenSimplex2D(TERRAIN_SEED);
+  const itemNoise = new OpenSimplex2D(ITEM_SEED);
+  const animalNoise = new OpenSimplex2D(ANIMAL_SEED);
+
+  // physics
+  const GRAV=2200, DRAG=0.00045, REST=0.62, GROUND_FRIC=0.86, MOVE=16000, BOOST=1.5;
+
+  // shapes per chunk (speed-optimized)
+  const MIN_SHAPES=8, MAX_SHAPES=12;
+
+  // entity caps in active region
+  const MAX_ANIMALS=15, MAX_CHESTS=8;
+
+  // Global stores
+  const chunks = new Map(); // key "cx,cy" -> {shapes, chests:[{id,x,y,r,opened}], animals: [static spawn points only]}
+  const openedChests = new Set(); // ids "cx,cy,i"
+
+  // ===== Input =====
+  const keys = new Map();
+  addEventListener('keydown', e=>{ keys.set(e.key.toLowerCase(), true); if(e.key==='r'||e.key==='R') resetPlayer(); });
+  addEventListener('keyup',   e=>keys.set(e.key.toLowerCase(), false));
+  const wantL=()=>keys.get('a')||keys.get('arrowleft');
+  const wantR=()=>keys.get('d')||keys.get('arrowright');
+  const wantJ=()=>keys.get(' ')||keys.get('space');
+  const wantBoost=()=>keys.get('shift');
+
+  // ===== Player / Camera =====
+  const player = { x:32, y:-64, vx:0, vy:0, r:18, on:false, coins:0, gems:0, boosts:0 };
+  const cam   = { x:0, y:0 };
+  function resetPlayer(){ player.x=32; player.y=-64; player.vx=player.vy=0; player.on=false; }
+
+  // ===== Terrain Generation via Noise =====
+  function makeChunk(cx, cy){
+    const key = cx+','+cy; if (chunks.has(key)) return chunks.get(key);
+    const shapes=[]; const chests=[]; const animalSpawns=[];
+
+    // Determine a few anchor points from noise to place larger shapes
+    // We sample a small grid inside the chunk and threshold the noise to decide placements.
+    const baseX = cx*CHUNK, baseY = cy*CHUNK;
+    let placed=0; const target = MIN_SHAPES + ((Math.abs(terrainNoise.noise2D(cx*0.73, cy*0.61))* (MAX_SHAPES-MIN_SHAPES))|0);
+
+    function addRect(x,y,w,h,a,isPlat){ shapes.push({type:'rect',x,y,w,h,angle:a,isPlatform:!!isPlat}); }
+    function addCirc(x,y,r){ shapes.push({type:'circle',x,y,r}); }
+
+    // Terrain field: coherent structure of platforms & blobs
+    for (let gy=0; gy<6 && placed<target; gy++){
+      for (let gx=0; gx<6 && placed<target; gx++){
+        const sx = baseX + (gx+0.5)*(CHUNK/6);
+        const sy = baseY + (gy+0.5)*(CHUNK/6);
+        const n = terrainNoise.noise2D(sx*0.0025, sy*0.0025); // low frequency
+        if (n > 0.25){ // rect plank
+          const w = 140 + n*120;
+          const h = 14 + (n*6);
+          const a = (n*2-1)*0.35;
+          addRect(sx, sy, w, h, a, true); placed++;
+        } else if (n < -0.2){ // circle blob
+          const r = 28 + Math.abs(n)*90;
+          addCirc(sx, sy, r); placed++;
+        }
+      }
+    }
+    // If sparse, add a couple of filler planks for playability
+    while(placed<MIN_SHAPES){
+      const rx = baseX + (Math.random()*CHUNK);
+      const ry = baseY + (Math.random()*CHUNK);
+      addRect(rx, ry, 160, 16, (Math.random()-0.5)*0.3, true); placed++;
+    }
+
+    // Chest spawns (rare): use item noise threshold + hash to position within cell
+    for (let i=0;i<4;i++){
+      const cxp = baseX + (i+0.35)*(CHUNK/4);
+      const cyp = baseY + (0.35+0.3*i)*(CHUNK/4);
+      const n = itemNoise.noise2D(cxp*0.004, cyp*0.004);
+      if (n > 0.55 && chests.length<MAX_CHESTS){
+        // initial position
+        let x=cxp, y=cyp, r=14; // chest as small circle collider
+        // settle downward until resting on terrain or limit
+        y = settleOnTerrain(x, y, r, shapes);
+        const id = key+':'+chests.length;
+        const opened = openedChests.has(id);
+        chests.push({id,x,y,r,opened});
+      }
+    }
+
+    // Animal spawns: thresholded noise
+    for (let ay=0; ay<3; ay++) for (let ax=0; ax<3; ax++){
+      if (animalSpawns.length>=MAX_ANIMALS) break;
+      const sx = baseX + (ax+0.3)*(CHUNK/3);
+      const sy = baseY + (ay+0.7)*(CHUNK/3);
+      const n = animalNoise.noise2D(sx*0.003, sy*0.003);
+      if (n>0.45){
+        let x=sx, y=sy, r=12;
+        y = settleOnTerrain(x, y, r, shapes);
+        const dir = n>0.7?1:-1;
+        animalSpawns.push({x,y,r,dir,seed:(Math.abs(n)*1e6)|0});
+      }
+    }
+
+    const chunk = {cx,cy,shapes,chests,animalSpawns};
+    chunks.set(key, chunk);
+    if (chunks.size>MAX_CACHE){ const firstKey = chunks.keys().next().value; chunks.delete(firstKey); }
+    return chunk;
+  }
+
+  function settleOnTerrain(x,y,r,shapes){
+    // Move downward up to CHUNK*0.6 until colliding with any shape; then step up a bit for stability
+    let maxDrop = CHUNK*0.6, step=6; let yy=y;
+    for (let t=0;t<maxDrop; t+=step){
+      yy += step;
+      if (collidesAny({x,y:yy,r}, shapes)) { yy -= step; break; }
+    }
+    return yy;
+  }
+
+  function collidesAny(circle, shapes){
+    for (let s of shapes){ if (s.type==='circle') { if (circleCircleOverlap(circle,s)) return true; } else { if (circleRectOverlap(circle,s)) return true; } }
+    return false;
+  }
+
+  // ===== Collision Helpers =====
+  function circleCircleOverlap(b,c){ const dx=b.x-c.x, dy=b.y-c.y; const rr=b.r+c.r; return dx*dx+dy*dy<=rr*rr; }
+  function resolveCircleCircle(ball,c){
+    const dx=ball.x-c.x, dy=ball.y-c.y; const rr=ball.r+c.r; const d2=dx*dx+dy*dy; if (d2>rr*rr) return false; const d=Math.sqrt(d2)||.0001;
+    const nx=dx/d, ny=dy/d, pen=rr-d; ball.x+=nx*pen; ball.y+=ny*pen; const vn=ball.vx*nx+ball.vy*ny; const tx=ball.vx-vn*nx; const ty=ball.vy-vn*ny; ball.vx=tx+(-vn)*REST*nx; ball.vy=ty+(-vn)*REST*ny; if (ny<-0.6) ball.on=true; return true; }
+  function circleRectOverlap(b,r){
+    const cs=Math.cos(r.angle), sn=Math.sin(r.angle);
+    const lx =  cs*(b.x-r.x) + sn*(b.y-r.y);
+    const ly = -sn*(b.x-r.x) + cs*(b.y-r.y);
+    const hx=r.w*0.5, hy=r.h*0.5; const cx=clamp(lx,-hx,hx), cy=clamp(ly,-hy,hy);
+    const dx=lx-cx, dy=ly-cy; return (dx*dx+dy*dy)<=b.r*b.r;
+  }
+  function resolveCircleRect(ball,r){
+    const cs=Math.cos(r.angle), sn=Math.sin(r.angle);
+    const lx =  cs*(ball.x-r.x) + sn*(ball.y-r.y);
+    const ly = -sn*(ball.x-r.x) + cs*(ball.y-r.y);
+    const hx=r.w*0.5, hy=r.h*0.5; const cx=clamp(lx,-hx,hx), cy=clamp(ly,-hy,hy);
+    let dx=lx-cx, dy=ly-cy; let d2=dx*dx+dy*dy; if (d2>ball.r*ball.r){ return false; }
+    let d=Math.sqrt(d2)||.0001; let nx=dx/d, ny=dy/d; if (!isFinite(nx)||!isFinite(ny)){
+      const ex=hx-Math.abs(lx), ey=hy-Math.abs(ly); if (ex<ey){ nx= lx>0?1:-1; ny=0; } else { nx=0; ny= ly>0?1:-1; }
+    }
+    const wx =  cs*nx - sn*ny, wy = sn*nx + cs*ny; const pen=ball.r-d; ball.x+=wx*pen; ball.y+=wy*pen;
+    const vn=ball.vx*wx+ball.vy*wy; const tx=ball.vx-vn*wx; const ty=ball.vy-vn*wy; ball.vx=tx+(-vn)*REST*wx; ball.vy=ty+(-vn)*REST*wy;
+    if (wy<-0.6) ball.on=true; if (r.isPlatform && wy<-0.5) ball.vx*=GROUND_FRIC; return true;
+  }
+
+  function collideBallWithShapes(ball, shapes){ ball.on=false; for (let s of shapes){ if (s.type==='circle') resolveCircleCircle(ball,s); else resolveCircleRect(ball,s); } }
+
+  // ===== Active region helpers =====
+  function shapesAround(x,y){
+    const cx=Math.floor(x/CHUNK), cy=Math.floor(y/CHUNK); const res=[];
+    for (let j=-ACTIVE_RADIUS;j<=ACTIVE_RADIUS;j++) for (let i=-ACTIVE_RADIUS;i<=ACTIVE_RADIUS;i++){ res.push(...makeChunk(cx+i,cy+j).shapes); }
+    return res;
+  }
+  function chunksAround(x,y){ const cx=Math.floor(x/CHUNK), cy=Math.floor(y/CHUNK); const res=[]; for (let j=-ACTIVE_RADIUS;j<=ACTIVE_RADIUS;j++) for (let i=-ACTIVE_RADIUS;i<=ACTIVE_RADIUS;i++){ res.push(makeChunk(cx+i,cy+j)); } return res; }
+
+  // ===== Entities (Animals) =====
+  const activeAnimals = new Set(); // live instances in active area
+  function spawnAnimals(){ activeAnimals.clear(); const list=chunksAround(player.x,player.y); for (let ch of list){ for (let s of ch.animalSpawns){ if (activeAnimals.size<MAX_ANIMALS){ const rng=rndSeed(s.seed); activeAnimals.add({ x:s.x, y:s.y, vx:(rng()<.5?80:-80), vy:0, r:s.r, on:false }); } } } }
+
+  // ===== Items & Chests =====
+  function chestLoot(){ const r=Math.random(); if (r<0.6) return 'coin'; if (r<0.9) return 'gem'; return 'boost'; }
+  function openChest(ch){ if (ch.opened) return; ch.opened=true; openedChests.add(ch.id); const loot=chestLoot(); if (loot==='coin') player.coins++; else if (loot==='gem') player.gems++; else { player.boosts++; toast('Boost acquired! Press Shift to run faster.'); }
+    updateInv(); toast(loot==='coin'?'+1 Coin': loot==='gem'?'+1 Gem':'+1 Boost'); }
+  function updateInv(){ document.getElementById('inv').textContent = `Inventory — Coins: ${player.coins} · Gems: ${player.gems} · Boosts: ${player.boosts}`; }
+
+  // ===== Toaster =====
+  const toasts=document.getElementById('toasts');
+  function toast(t){ const el=document.createElement('div'); el.className='toast'; el.textContent=t; toasts.appendChild(el); setTimeout(()=>{ el.style.opacity='0'; el.style.transform='translateY(6px)'; setTimeout(()=>el.remove(),300); }, 1600); }
+
+  // ===== Simulation =====
+  let last=performance.now(), acc=0, DT=1/120;
+  function applyInput(dt){ let f=0; if (wantL()) f-=1; if (wantR()) f+=1; if (f!==0){ let m=wantBoost()&&player.boosts>0?BOOST:1; player.vx += f*MOVE*m*dt/(player.r*0.5); } if (wantJ() && player.on){ player.vy -= 900; player.on=false; } }
+
+  function integrateEntity(e, dt, shapes){ e.vy += GRAV*dt; const sp=Math.hypot(e.vx,e.vy); const drag=1/(1+DRAG*sp*dt); e.vx*=drag; e.vy*=drag; e.x += e.vx*dt; e.y += e.vy*dt; collideBallWithShapes(e, shapes); }
+
+  function physicsStep(dt){
+    applyInput(dt);
+    const localShapes = shapesAround(player.x, player.y);
+    integrateEntity(player, dt, localShapes);
+
+    // Camera follows player smoothly
+    cam.x = lerp(cam.x, player.x - vw*0.5, 0.12);
+    cam.y = lerp(cam.y, player.y - vh*0.5, 0.12);
+
+    // Animals
+    if (Math.random()<0.01) spawnAnimals(); // refresh occasionally as chunks change
+    for (let a of activeAnimals){
+      // simple wander
+      if (a.on && Math.random()<0.01){ a.vx = (Math.random()<0.5?-1:1) * (60+Math.random()*80); }
+      integrateEntity(a, dt, localShapes);
+      // bounce off player softly
+      if (circleCircleOverlap({x:a.x,y:a.y,r:a.r},{x:player.x,y:player.y,r:player.r})){
+        const dx=a.x-player.x, dy=a.y-player.y; const d=Math.hypot(dx,dy)||1; const nx=dx/d, ny=dy/d; a.vx += nx*120; a.vy += ny*80; player.vx -= nx*60; player.vy -= ny*40;
+      }
+    }
+
+    // Chests: open on overlap
+    const list=chunksAround(player.x,player.y);
+    for (let ch of list){ for (let chest of ch.chests){ if (!chest.opened){ if (circleCircleOverlap({x:player.x,y:player.y,r:player.r}, chest)){ openChest(chest); } } } }
+  }
+
+  // ===== Rendering =====
+  function drawBackground(){
+    // vertical gradient sky + subtle stars parallax
+    const g=ctx.createLinearGradient(0,cam.y,0,cam.y+vh);
+    g.addColorStop(0,'#0b0e16'); g.addColorStop(1,'#090a12'); ctx.fillStyle=g; ctx.fillRect(0,0,vw,vh);
+    // stars
+    ctx.save(); ctx.globalAlpha=0.3; ctx.translate(-cam.x*0.1,-cam.y*0.1);
+    const step=140; for (let y=-vh; y<vh*2; y+=step){ for (let x=-vw; x<vw*2; x+=step){ const n=terrainNoise.noise2D((x+Math.floor(cam.x))*0.01,(y+Math.floor(cam.y))*0.01); if (n>0.65){ ctx.fillStyle='rgba(200,220,255,.6)'; ctx.fillRect((x+((n*1000)&31)), (y+((n*2000)&31)), 2,2); } } }
+    ctx.restore();
+  }
+  function drawGrid(){ ctx.save(); ctx.strokeStyle='rgba(160,160,220,0.06)'; ctx.lineWidth=1; const step=64; const x0=Math.floor((cam.x-20)/step)*step, x1=cam.x+vw+20; const y0=Math.floor((cam.y-20)/step)*step, y1=cam.y+vh+20; ctx.beginPath(); for (let x=x0;x<=x1;x+=step){ ctx.moveTo(x-cam.x,0); ctx.lineTo(x-cam.x,vh);} for (let y=y0;y<=y1;y+=step){ ctx.moveTo(0,y-cam.y); ctx.lineTo(vw,y-cam.y);} ctx.stroke(); ctx.restore(); }
+  function drawShapes(){
+    ctx.save();
+    const list=chunksAround(cam.x+vw*0.5, cam.y+vh*0.5);
+    for (let ch of list){ for (let s of ch.shapes){ if (s.type==='circle'){ ctx.beginPath(); ctx.arc(s.x-cam.x, s.y-cam.y, s.r, 0, Math.PI*2); ctx.fillStyle='rgba(120,160,255,0.10)'; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle='rgba(160,200,255,0.35)'; ctx.stroke(); } else { ctx.save(); ctx.translate(s.x-cam.x, s.y-cam.y); ctx.rotate(s.angle); ctx.beginPath(); ctx.rect(-s.w/2, -s.h/2, s.w, s.h); ctx.fillStyle=s.isPlatform?'rgba(120,255,160,0.12)':'rgba(255,200,140,0.10)'; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle=s.isPlatform?'rgba(160,255,180,0.35)':'rgba(255,210,160,0.35)'; ctx.stroke(); ctx.restore(); } } }
+    ctx.restore();
+  }
+  function drawAnimals(){ ctx.save(); for (let a of activeAnimals){ const x=a.x-cam.x, y=a.y-cam.y; // shadow
+      ctx.beginPath(); ctx.ellipse(x+6,y+10,a.r*0.9,a.r*0.5,0,0,Math.PI*2); ctx.fillStyle='rgba(0,0,0,0.25)'; ctx.fill();
+      ctx.beginPath(); ctx.arc(x,y,a.r,0,Math.PI*2); ctx.fillStyle='#c084fc'; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle='#a78bfa'; ctx.stroke();
+      // eye
+      ctx.beginPath(); ctx.arc(x+a.r*0.25, y-a.r*0.2, 2.5, 0, Math.PI*2); ctx.fillStyle='#111'; ctx.fill(); }
+    ctx.restore(); }
+  function drawChests(){ ctx.save(); const list=chunksAround(cam.x+vw*0.5, cam.y+vh*0.5); for (let ch of list){ for (let c of ch.chests){ const x=c.x-cam.x, y=c.y-cam.y; // shadow
+        ctx.beginPath(); ctx.ellipse(x+6,y+8,c.r*0.9,c.r*0.5,0,0,Math.PI*2); ctx.fillStyle='rgba(0,0,0,0.25)'; ctx.fill();
+        // chest body
+        ctx.beginPath(); ctx.arc(x,y,c.r,0,Math.PI*2); ctx.fillStyle = c.opened?'rgba(150,150,150,0.20)':'rgba(255,209,102,0.20)'; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle = c.opened?'rgba(180,180,180,0.45)':'rgba(255,209,102,0.55)'; ctx.stroke();
+        // latch
+        if (!c.opened){ ctx.fillStyle='#ffd166'; ctx.fillRect(x-3,y-2,6,8); }
+    } }
+    ctx.restore(); }
+  function drawPlayer(){ ctx.save(); const x=player.x-cam.x, y=player.y-cam.y; ctx.beginPath(); ctx.ellipse(x+8,y+12,player.r*0.9,player.r*0.55,0,0,Math.PI*2); ctx.fillStyle='rgba(0,0,0,0.25)'; ctx.fill(); ctx.beginPath(); ctx.arc(x,y,player.r,0,Math.PI*2); ctx.fillStyle='#7dd3fc'; ctx.fill(); ctx.lineWidth=3; ctx.strokeStyle='#38bdf8'; ctx.stroke(); const grad=ctx.createRadialGradient(x-player.r*0.4,y-player.r*0.4,2,x,y,player.r); grad.addColorStop(0,'rgba(255,255,255,.85)'); grad.addColorStop(1,'rgba(255,255,255,0)'); ctx.beginPath(); ctx.arc(x,y,player.r,0,Math.PI*2); ctx.fillStyle=grad; ctx.fill(); ctx.restore(); }
+
+  function draw(){ drawBackground(); drawGrid(); drawShapes(); drawChests(); drawAnimals(); drawPlayer(); document.getElementById('dbg').textContent=`pos: (${player.x.toFixed(1)}, ${player.y.toFixed(1)}) v=(${player.vx.toFixed(1)}, ${player.vy.toFixed(1)}) chunks: ${chunks.size} animals: ${activeAnimals.size}`; }
+
+  function frame(now){ const dt=Math.min(0.033,(now-last)/1000); last=now; acc+=dt; while(acc>=DT){ physicsStep(DT); acc-=DT; } draw(); requestAnimationFrame(frame); }
+
+  // Start
+  updateInv(); spawnAnimals(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
